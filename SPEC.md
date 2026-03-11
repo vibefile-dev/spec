@@ -441,7 +441,14 @@ vibe run build                     vibe run build
 
 ### Cache location
 
-Compiled scripts live in `.vibe/compiled/`. This directory **should be committed to version control** — it means the team shares compiled targets and only one person pays the LLM cost when a target changes.
+Compiled scripts live in `.vibe/compiled/`. This directory **must be committed to version control.**
+
+Why:
+
+- **CI runs are free and fast.** CI environments run `vibe run test` using the cached script — no LLM call, no API key needed, no latency. Without committed compiled output, every CI run would require an API key and incur LLM costs.
+- **One person pays the cost.** When a recipe changes, one developer runs `vibe run` (or `--recompile`), the LLM generates the script, and it's committed alongside the Vibefile change. Every subsequent run — by any teammate, in any CI pipeline — uses the cached script for free.
+- **Auditability.** Code review on a Vibefile change shows both the intent change (the recipe) and the implementation change (the compiled shell). Reviewers can catch problems before they reach production.
+- **Reproducibility.** The same script runs everywhere. No variance from different LLM responses across machines or API calls.
 
 ```
 my-project/
@@ -455,6 +462,8 @@ my-project/
     │   └── test.lock
     └── skills/
 ```
+
+Projects should **not** add `.vibe/compiled/` to `.gitignore`. The `vibe init` command (when implemented) will generate an appropriate `.gitignore` that excludes the binary but keeps the compiled output tracked.
 
 ### Cache invalidation
 
@@ -521,16 +530,169 @@ The compiled script can also be hand-edited if needed. The CLI will detect that 
 
 ---
 
+## Failure handling
+
+Not all failures are equal. When a generated script exits with a non-zero code, the CLI needs to know: was the script wrong, or did the script correctly detect a real problem? The answer determines whether to retry, cache, or just report the failure.
+
+### Exit code convention
+
+Generated scripts use exit codes as a protocol between the script and the CLI:
+
+| Exit code | Meaning | CLI behaviour |
+|-----------|---------|---------------|
+| `0` | Success | Cache the script, report success |
+| `1` | **Task failed legitimately** | Report failure, do **not** retry — the script is correct but the task found a real problem (tests fail, lint errors, etc.) |
+| `2` | **Precondition not met** | Report the missing requirement, do **not** retry — the environment isn't ready |
+| `≥ 3` | **Script error / generation bug** | Auto-retry with error context (up to `max_retries` attempts) |
+
+The system prompt instructs the LLM to follow this convention when generating scripts. Exit 1 means "I ran the task correctly and it found a problem." Exit 2 means "I checked and a required tool or version is missing." Any other non-zero exit (3+) typically means the script itself is broken — a wrong command, bad flags, or a misunderstanding of the project.
+
+### Preflight checks
+
+The system prompt instructs the LLM to emit a **preflight section** at the top of every generated script. This section verifies that required tools and versions are available before doing anything, and exits with code 2 if something is missing:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# --- preflight ---
+command -v go >/dev/null 2>&1 || { echo "error: go is required but not installed"; exit 2; }
+go_version=$(go version | grep -oP 'go\K[0-9]+\.[0-9]+')
+[[ "$(printf '%s\n' "1.25" "$go_version" | sort -V | head -1)" == "1.25" ]] || { echo "error: go >= 1.25 required (found $go_version)"; exit 2; }
+
+# --- task ---
+go test -race -v ./...
+```
+
+The LLM infers what to check from the project context — `go.mod` tells it the Go version, `package.json` tells it the Node version, and so on. Preflight checks **verify but never install** — the script should not run `apt-get install` or `brew install` for system-level dependencies. If a tool is missing, the script reports what's needed and exits.
+
+This gives the user a clear, actionable error message ("go >= 1.25 required") instead of a cryptic failure halfway through execution.
+
+### Auto-retry on generation errors
+
+When a script exits with code 3 or higher, the CLI assumes the script itself is wrong and retries:
+
+```
+vibe run build
+  → generate script (attempt 1)
+  → execute → exit code 127 (command not found)
+  → retry: send error output back to LLM
+    "The script failed with: line 5: pnpm: command not found
+     The project uses npm, not pnpm. Regenerate the script."
+  → generate script (attempt 2)
+  → execute → exit code 0
+  → cache the fixed script
+```
+
+The retry prompt includes:
+- The original task recipe
+- The script that failed
+- The full stderr/stdout from the failed execution
+- An instruction to fix the problem
+
+Retry behaviour is configurable:
+
+```makefile
+max_retries = 2     # default: 1 (one retry after the initial attempt)
+```
+
+```sh
+vibe run build --no-retry   # disable retry, fail immediately
+```
+
+If all retries are exhausted, the CLI fails with the last error and does **not** cache the broken script.
+
+### Caching and failure interaction
+
+How failure interacts with the compiled target cache:
+
+| Outcome | Cache the script? | Why |
+|---------|:-----------------:|-----|
+| Exit 0 — success | ✅ Yes | Script works |
+| Exit 1 — legitimate failure | ✅ Yes | Script is correct; the task found a real problem (user fixes their code and reruns) |
+| Exit 2 — precondition not met | ✅ Yes | Script is correct; the environment needs setup (user installs the tool and reruns) |
+| Exit 3+ — retry succeeds | ✅ Yes | Cache the **fixed** version |
+| Exit 3+ — retries exhausted | ❌ No | Script is broken; don't persist it |
+
+The key insight: exit 1 and exit 2 scripts are **correct scripts**. Caching them means the next `vibe run` skips the LLM call entirely — the user fixes their code or installs the missing tool, and reruns instantly.
+
+### Dependency failure
+
+When a target's dependency fails, the default behaviour is to **stop the chain**. Remaining dependencies are skipped and the dependent target does not run.
+
+```
+vibe run deploy        # depends on: test, build
+  → run test → exit 1 (tests fail)
+  → skip build (dependency test failed)
+  → skip deploy
+  ✗ deploy failed: dependency "test" failed
+```
+
+This is the safe default. A `--continue-on-error` flag may be added in the future for CI scenarios where you want to run all independent targets and collect all failures.
+
+---
+
 ## CLI interface
 
 ```sh
-vibe run <target>              # run a target and its dependencies
-vibe run <target> --dry        # print what would be executed without running
-vibe run <target> --recompile  # force LLM recompile for this target
-vibe run <target> --recompile-all  # recompile this target and all deps
-vibe list                      # list all targets with their descriptions
-vibe check                     # validate the Vibefile without running anything
-vibe status                    # show compiled/uncompiled state of all targets
+vibe init                         # detect project type and generate a Vibefile
+vibe init --language <lang>       # use a specific language template
+vibe init --empty                 # create a minimal skeleton Vibefile (no detection)
+vibe init --force                 # overwrite an existing Vibefile
+vibe run <target>                 # run a target and its dependencies
+vibe run <target> --dry           # print what would be executed without running
+vibe run <target> --recompile     # force LLM recompile for this target
+vibe run <target> --recompile-all # recompile this target and all deps
+vibe list                         # list all targets with their descriptions
+vibe check                        # validate the Vibefile without running anything
+vibe status                       # show compiled/uncompiled state of all targets
+```
+
+### `vibe init`
+
+Bootstraps a new Vibefile by detecting the project's language, framework, and infrastructure from manifest files (`go.mod`, `package.json`, `Dockerfile`, etc.) and generating targets appropriate for the detected stack. No LLM call is required — templates are preconfigured.
+
+Detection uses a pluggable registry of detectors. Built-in detectors are compiled into the CLI; community detectors can be added as YAML template files:
+
+- `.vibe/templates/<lang>.yaml` — project-local template override
+- `~/.vibe/templates/<lang>.yaml` — user-global template override
+- Built-in templates — always available as fallback
+
+Language detectors and infrastructure detectors run independently and their results are merged. A Go project with a Dockerfile gets Go targets plus a Docker target.
+
+#### `--empty` mode
+
+When `--empty` is passed, `vibe init` skips all detection and creates a minimal skeleton Vibefile containing only the `model` variable, a `name` variable derived from the directory name, and commented-out examples showing the target syntax. This is useful for:
+
+- Projects where auto-detection produces targets that don't match the desired workflow
+- Codebases with unconventional structures that detectors don't recognize
+- Users who prefer to define their targets from scratch
+
+```sh
+vibe init --empty       # creates a skeleton Vibefile with no targets
+vibe init --empty --force  # overwrite an existing Vibefile with a skeleton
+```
+
+The generated skeleton:
+
+```makefile
+model = claude-sonnet-4-6
+name  = my-project
+
+# Add your targets below. Each target has a name, an optional dependency
+# list, and a plain-English recipe describing what the task should do.
+#
+# Example:
+#
+# build:
+#     "compile the project for production"
+#
+# test:
+#     "run all tests with verbose output"
+#
+# deploy: test build:
+#     "deploy to production and verify health"
+#     @require clean git status
 ```
 
 ---
@@ -583,14 +745,14 @@ These are actively undecided. Open an issue or join the Discord.
 2. **Registry protocol** — should Vibefile define a minimal registry query API that any implementation satisfies, or adopt an existing standard (e.g. the official MCP registry API)?
 3. **Registry-free operation** — how much should work with zero registry configured? Ideally everything, with registry being an enhancement not a requirement.
 4. **`.vibe/config.yaml` vs inline** — is a separate config file the right call, or is there a way to keep everything in the Vibefile without it becoming noisy?
-5. **`@require` evaluation** — how exactly are preconditions checked? LLM-evaluated, or a fixed set of known checks?
+5. ~~**`@require` evaluation**~~ — resolved: LLM-generated preflight checks use exit code 2 for precondition failures. CLI-side `@require` checks may be added later as an optimization.
 6. **Variable syntax** — `$(VAR)` Make-style, or `${VAR}` shell-style, or something else?
 7. **Target naming** — should hyphens and underscores both be valid, or pick one?
-8. **Failure behaviour** — if a dependency fails, should remaining dependencies be skipped or attempted?
-9. **Codegen transparency** — should the generated shell be shown to the user before execution? Always, on request, or never?
-10. **Compiled output in git** — should `.vibe/compiled/` be committed? Committing means shared cache and auditability; not committing means cleaner diffs. Currently leaning toward committed.
-11. **Context file tracking** — how does the CLI know which context files were used to generate a given compiled target? Should the lock file record this explicitly, or should context collection be deterministic enough that it can be recomputed?
-12. **Manual edits to compiled scripts** — should hand-editing a compiled `.sh` file be supported, discouraged, or blocked? How should the CLI communicate that a compiled script diverges from its recipe?
+8. ~~**Failure behaviour**~~ — resolved: dependency failures stop the chain. See [Failure handling](#failure-handling).
+9. ~~**Codegen transparency**~~ — resolved: generated scripts are always shown before execution. The `--dry` flag shows them without executing.
+10. ~~**Compiled output in git**~~ — resolved: `.vibe/compiled/` must be committed. CI runs use cached scripts with zero LLM cost. See [Compiled targets — Cache location](#cache-location).
+11. ~~**Context file tracking**~~ — resolved: the `.lock` file records checksums of all context files used for generation. On each run the CLI recomputes and compares. See [Cache invalidation](#cache-invalidation).
+12. ~~**Manual edits to compiled scripts**~~ — resolved: supported with a warning. The CLI detects hand-edits via script hash mismatch and warns, but still executes. Use `--recompile` to regenerate from the recipe.
 13. **Sandbox runtime** — Docker is the obvious default, but it's a heavy dependency. Should a lighter-weight option (e.g. a WASM sandbox, `bubblewrap` on Linux) also be supported?
 14. **Sandbox image** — what base image does the sandbox use? A fixed minimal image, or one inferred from the repo's detected stack (e.g. a Node image for a JS project)?
 15. **Repo mount granularity** — should the entire repo be mounted read-write, or should write access be restricted to specific directories the task declares it needs?
